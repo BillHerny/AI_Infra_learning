@@ -1,4 +1,0 @@
-{
-    "cmake.sourceDirectory": "${workspaceFolder}/hello_cuda",
-    "cmake.buildDirectory": "${workspaceFolder}/hello_cuda/build"
-}

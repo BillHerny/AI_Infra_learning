@@ -1,0 +1,13 @@
+{
+    // 多根工作区：每个项目作为一个独立的工作区文件夹，
+    // 各自拥有自己的 .vscode/settings.json，互不干扰。
+    "folders": [
+        {
+            "path": "hello_cuda"
+        }
+    ],
+    // 以后新增平级项目时，在这里追加，例如：
+    // { "path": "foo" },
+    // { "path": "bar" }
+    "settings": {}
+}
