@@ -3,7 +3,7 @@
     // 各自拥有自己的 .vscode/settings.json，互不干扰。
     "folders": [
         {
-            "path": "hello_cuda"
+            "path": "cuda_basic"
         }
     ],
     // 以后新增平级项目时，在这里追加，例如：

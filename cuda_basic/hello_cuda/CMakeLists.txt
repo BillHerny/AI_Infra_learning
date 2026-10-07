@@ -1,9 +1,3 @@
-cmake_minimum_required(VERSION 3.20)
-project(hello_cuda LANGUAGES CXX CUDA)
-
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
 add_executable(hello_cuda hello.cu)
 set_target_properties(hello_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
@@ -11,59 +5,33 @@ set_target_properties(hello_cuda PROPERTIES
 
 #[===[
 ========================================================================
-逐行详细说明（按上方源代码顺序）
+本文件：hello_cuda 练习（子目录 / 目标级）
 ========================================================================
 
-【第 1 行】cmake_minimum_required(VERSION 3.20)
+  这是 cuda_basic 工程下的一个练习子目录。按约定，这里只写"目标级"
+  命令：全局设置（C++ 标准、CUDA 架构、输出目录等）都放在顶层
+  cuda_basic/CMakeLists.txt 里，并通过 add_subdirectory(hello_cuda)
+  自动向下传递，本文件无需重复。
 
-  · 作用：声明本工程所需的 CMake 最低版本为 3.20。
-  · 为什么是 3.20：版本号不仅决定"能否构建"，还会切换 CMake 的
-    策略（Policy）默认行为。例如 CUDA 作为一等语言（LANGUAGES CUDA）、
-    较新的 CUDA 架构检测逻辑等都依赖较新版本，写低了可能行为不一致。
-  · 若本机 CMake 低于 3.20，配置阶段会直接报错并终止，而不是
-    产生难以排查的构建错误——这是一种"尽早失败"的保护。
+  也就是说，本文件里"没有" cmake_minimum_required、project、
+  set(CMAKE_CUDA_*) 这些工程级语句——它们属于顶层，不属于这里。
 
-【第 2 行】project(hello_cuda LANGUAGES CXX CUDA)
-
-  · hello_cuda：工程名，会写入 ${PROJECT_NAME} 等变量，
-    并在默认情况下决定构建产物名（此处被 add_executable 显式覆盖）。
-  · LANGUAGES CXX CUDA：启用两种源码语言——
-      - CXX  → 由 C++ 编译器（g++/clang++）编译 .cpp 文件；
-      - CUDA → 由 NVIDIA 的 nvcc 驱动编译 .cu 文件，
-               程序的主机端代码交给底层 C++ 编译器，设备端代码
-               编译成 GPU 可执行的 PTX/cubin。
-  · 关键点：CMake ≥ 3.8 原生支持 CUDA 语言，因此无需再手写
-    find_package(CUDA) 或自定义 nvcc 规则；CMake 会自动定位 nvcc
-    并注入 cudart 运行时库。
-
-【第 3 行】set(CMAKE_CUDA_STANDARD 17)
-
-  · 指定编译 .cu 文件时所使用的 C++ 语言标准为 C++17。
-  · 该变量是"目录级默认值"，影响本目录及子目录中之后创建的目标。
-  · 与之对应的还有 CMAKE_CXX_STANDARD（用于 .cpp）。单独设置
-    CMAKE_CUDA_STANDARD 是因为 CUDA 文件走的是 nvcc，
-    CMake 会把它翻译成 nvcc 的 -std=c++17（具体旗标随 CUDA 版本而异）。
-  · 为什么用 17：C++17 提供了结构化绑定、if constexpr、std::optional
-    等特性，同时被主流 CUDA 工具链良好支持，兼顾现代性与兼容性。
-
-【第 4 行】set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-  · 含义：强制要求编译器必须支持第 3 行指定的标准。
-  · 若为 OFF（默认），当 nvcc 不支持 C++17 时，CMake 会"静默降级"
-    到较低标准，导致你写的 C++17 代码编译失败且原因隐蔽。
-  · 若为 ON，则在配置/编译阶段就能得到明确报错，便于定位环境问题。
-
-【第 5 行】add_executable(hello_cuda hello.cu)
+------------------------------------------------------------------------
+【第 1 行】add_executable(hello_cuda hello.cu)
+------------------------------------------------------------------------
 
   · 创建一个名为 hello_cuda 的可执行目标（build target）。
   · 源文件只有 hello.cu 一个。CMake 会依据扩展名 .cu 自动选用
     CUDA 编译流程（主机端 + 设备端），并自动完成两部分的链接。
-  · 由于工程启用了 CUDA 语言，CMake 还会自动把 CUDA 运行时库
+  · 由于顶层工程已启用 CUDA 语言，CMake 会自动把 CUDA 运行时库
     （cudart）链接进该目标，无需手写 target_link_libraries(... cudart)。
+  · 产物路径：因顶层设置了 CMAKE_RUNTIME_OUTPUT_DIRECTORY，最终
+    可执行文件落在 build/hello_cuda（即 ./build/hello_cuda）。
 
-【第 6-8 行】set_target_properties(hello_cuda PROPERTIES
-              CUDA_SEPARABLE_COMPILATION ON
-          )
+------------------------------------------------------------------------
+【第 2-4 行】set_target_properties(hello_cuda PROPERTIES
+                  CUDA_SEPARABLE_COMPILATION ON)
+------------------------------------------------------------------------
 
   · set_target_properties：为一个已存在的目标批量设置属性。
     第一个参数是目标名 hello_cuda，随后按 "属性名 值" 成对书写。
@@ -78,28 +46,19 @@ set_target_properties(hello_cuda PROPERTIES
     设备函数，就必须开启，否则会报 "undefined reference" 之类的
     设备符号链接错误。
   · 代价：开启后会略微增加构建时间与产物体积。
-  · 第 8 行的 ")" 用于闭合第 6 行开启的参数列表。
+  · 第 4 行的 ")" 用于闭合第 2 行开启的参数列表。
 
-========================================================================
-补充：构建与运行
-========================================================================
+------------------------------------------------------------------------
+【为什么这里不写 project()】
+------------------------------------------------------------------------
 
-  cmake -S . -B build        # 配置：生成构建系统（本例为 Makefile）
-  cmake --build build        # 构建：编译并链接出 ./build/hello_cuda
-  ./build/hello_cuda         # 运行：打印 GPU 信息与 8 行 Hello
+  · project() 属于"工程级"，一个工程只在顶层写一次。子目录若再写
+    project()，会在当前作用域里重置工程名等变量，属于多余且容易
+    混淆的做法。
+  · 同理，CMAKE_CUDA_STANDARD / CMAKE_CUDA_ARCHITECTURES 等全局设置
+    也只在顶层写一次，子目录自动继承——这正是"工程级 / 目标级"
+    分层的意义：公共设置集中一处，各练习只声明自己的目标。
 
-========================================================================
-补充：关于本注释块语法
-========================================================================
-
-  · 本文件末尾使用的是 CMake 的"括号块注释"：以 #[[ 开始、以两个
-    右方括号结束，中间内容原样保留、无需逐行加 "#"，适合放说明文档。
-  · 关键陷阱：普通 #[[ ... ]] 注释在遇到第一个连续的两个右方括号时
-    就会结束，且不支持嵌套；因此正文里不能直接书写这两个字符。
-    否则注释会提前闭合，其后的文字会被当成 CMake 命令解析并报错：
-    "Expected a command name, got quoted argument ..."。
-  · 解决办法：改用"带等号"的定界符——在开头的两个方括号之间插入
-    若干等号（本注释块用的是三个），结尾用相同数量的等号对称闭合。
-    改为该形式后，正文即可安全地书写 ]] 这样的字符而不提前闭合。
+  · 想新增练习时，照抄本文件的骨架即可（改成自己的目标名与源文件名）。
 
 ]===]
