@@ -44,10 +44,19 @@ int main(int argc, char** argv)
     printf("N = %d, grid number = %d, thread_per_block = %d, each array = %.1f MiB\n",
            n, gridSize, blockSize, bytes_per_vector / 1024.0 / 1024.0);
     
-    float* h_a = (float*)malloc(bytes_per_vector);
-    float* h_b = (float*)malloc(bytes_per_vector);
-    float* h_c = (float*)malloc(bytes_per_vector);
+    // float* h_a = (float*)malloc(bytes_per_vector);
+    // float* h_b = (float*)malloc(bytes_per_vector);
+    // float* h_c = (float*)malloc(bytes_per_vector);
     float* ref = (float*)malloc(bytes_per_vector);
+    //此处锁页内存较好，有效减少DTH到CPU的拷贝时间
+    //cudaHostAlloc 的页是锁死在物理内存里的 —— 永远不会被换出，也永远不需要缺页
+    float* h_a;
+    float* h_b;
+    float* h_c;
+    CUDA_CHECK(cudaHostAlloc(&h_a, bytes_per_vector, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_b, bytes_per_vector, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_c, bytes_per_vector, cudaHostAllocDefault));
+
     for(int i = 0 ; i < n ; i++) {h_a[i] = 1.0f; h_b[i] = 2.0f;}
 
     float *d_a, *d_b, *d_c;
@@ -141,9 +150,9 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaFree(d_a));
     CUDA_CHECK(cudaFree(d_b));
     CUDA_CHECK(cudaFree(d_c));
-    free(h_a);
-    free(h_b);
-    free(h_c);
+    CUDA_CHECK(cudaFreeHost(h_a));
+    CUDA_CHECK(cudaFreeHost(h_b));
+    CUDA_CHECK(cudaFreeHost(h_c));
     free(ref);
     CUDA_CHECK(cudaEventDestroy(e_HTD_start));
     CUDA_CHECK(cudaEventDestroy(e_HTD_stop));

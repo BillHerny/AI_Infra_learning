@@ -20,7 +20,8 @@
 | **峰值带宽** | **≈ 256.3 GB/s** | 判读一切带宽数字的基准线 |
 | FP32 峰值 | ≈ 9.5 TFLOP/s | |
 | 机器平衡点 | 37.1 FLOP/Byte | 9.5e12 ÷ 256.3e9 |
-| PCIe | ≈ 12 GB/s（实测可用） | 约为显存的 5% |
+| **L2 缓存** | **~24 MiB**（Ada 这一档） | 工作集小于它时，带宽可**超过** DRAM 峰值 |
+| **PCIe** | **PCIe 4.0 ×8**，理论 **15.75 GB/s**，实测 12.5~13 GB/s | 约为显存的 5% |
 | CUDA | 12.x，`CMAKE_CUDA_ARCHITECTURES 89` | |
 | 测试规模 | N = 2²⁶ = 67,108,864 | 每个数组 256 MiB |
 
@@ -40,6 +41,10 @@
 | ⑥ | 加传输计时，得到 805.31 GB/s | 假数据 | 求最小值的**哨兵初值**写错了 |
 | ⑦ | 补同步，报 `device not ready` | 运行期错误 | `cudaEventElapsedTime` 前必须有同步 |
 | ⑧ | 把 `Device` 写成 `Event` 又报错 | 编译期错误 | `cudaDeviceSynchronize()` 不吃参数 |
+| ⑨ | 学 `ncu`：导出报告 + 判读 SOL | 看懂了整份报告 | kernel 是**彻底的 DRAM 带宽受限**（90.78%），内部无大优化空间 |
+| ⑩ | 发现 D2H 要 **134 ms**（比 H2D 还慢） | 数字反常 | **缺页中断**：`h_c` 从来没被 CPU 写过 |
+| ⑪ | 三个 host 数组换 `cudaHostAlloc` | D2H 134→20.6 ms，**程序快 2.90 倍** | 传输代码比 kernel 值钱 |
+| ⑫ | 查 PCIe 链路（Gen4 ×8） | 理论 15.75 GB/s | 传输已达理论值 **79~83%**，到顶了 |
 
 ### 1.2 一句话教训表（背这张表）
 
@@ -56,6 +61,10 @@
 | 太圆的数字 | `1.0000 ms` 这种 4 位小数全 0 的，先怀疑它是初值 |
 | 限流与计数 | 限制打印用 `if` **包住 printf**；计数 `++` **永远无条件执行**，两者别塞进同一个 `if` |
 | 参数传递 | shell 不会算数，`atoi` 只认开头的数字 |
+| **缺页中断** | `malloc` 的内存**没有落地**，第一次写要付缺页中断（~2 µs/页）。要和 GPU 交换的内存必须用 **`cudaHostAlloc`** |
+| **ncu 的盲区** | **`ncu` 只看得见 kernel**。程序 95% 的时间可能花在 kernel 之外，只能靠你自己的计时代码发现 |
+| **工具建议** | profiler 给的是**通用建议**，不是针对你的 —— 必须用自己的物理常识过滤 |
+| **时间账** | 别只看 kernel 带宽。算「kernel 占整程序多少」—— 本例可分页时只有 **1.81%**，锁页后 5.26% |
 
 ---
 
@@ -633,6 +642,192 @@ cudaDeviceXxx()      →  都不带参数   (cudaDeviceSynchronize、cudaDeviceR
 
 ---
 
+### Q11. `ncu` 的输出怎么放进指定文件夹？
+
+**结论：三条路，各有各的产物。**
+
+```bash
+mkdir -p logs/ncu
+
+ncu --set full -f -o logs/ncu/vadd_b256 \
+    --log-file logs/ncu/vadd_b256.log \
+    ./build/bin/my_vector_add $((1<<26)) 256
+```
+
+| 参数 | 产物 | 内容 |
+|---|---|---|
+| `-o <文件名>` | `vadd_b256.ncu-rep` | **二进制报告**（给 GUI / `--import` 用） |
+| `-f` | — | 强制覆盖已存在的文件（**不加会报错退出**） |
+| `--log-file <文件>` | `vadd_b256.log` | ncu 自己的消息：`==PROF==` 进度 + `Report: <路径>` |
+| `> out.txt 2>&1` | 任意文件 | ncu 消息 + **你自己程序的 printf**，混在一起 |
+
+#### 2.11.1 三个实测坑
+
+**坑 1：`-o` 不能传目录。**
+
+```bash
+ncu ... -o logs/ncu/ ...        # ❌ 报错
+```
+
+```
+'logs/ncu/' is not a valid file name
+```
+
+必须给完整文件名。
+
+**坑 2：带 `-o` 时，ncu 不再往终端打报告正文。**
+
+它只在控制台回一句 `==PROF== Report: /path/to/xxx.ncu-rep`。想看正文要 `--import`：
+
+```bash
+ncu --import logs/ncu/vadd_b256.ncu-rep --page details
+ncu --import logs/ncu/vadd_b256.ncu-rep --page details --csv > logs/ncu/vadd.csv
+ncu-ui logs/ncu/vadd_b256.ncu-rep        # 图形界面，最舒服
+```
+
+**坑 3：`--set full` 默认会 profile 每一次 kernel 启动。**
+
+我的程序里有 1 次 warm-up + 20 次计时循环 = **21 次**，每次 34 遍重放 → 慢到无法忍受。
+
+```bash
+# ✅ 只 profile 一次
+ncu --set full -k vectorAdd --launch-count 1 ...
+```
+
+| 参数 | 作用 |
+|---|---|
+| `-k vectorAdd` | 只匹配这个名字的 kernel（**大小写敏感**） |
+| `--launch-count 1` | 只 profile 一次 |
+| `--launch-skip <n>` | 跳过前 n 次匹配的启动 |
+
+#### 2.11.2 实测对照表
+
+| 写法 | 产物 | 里面有什么 |
+|---|---|---|
+| `-o logs/ncu/smoke` | `smoke.ncu-rep`（42 KB） | 二进制报告 |
+| `-o logs/ncu/`（目录） | ❌ 报错 | `is not a valid file name` |
+| `--log-file logs/ncu/console.txt` | 306 B | `==PROF==` 消息 + `Report: <路径>` |
+| `> C_stdout.txt 2> C_stderr.txt` | 12 行 / **0 行** | ncu 消息 + 程序输出（**都在 stdout，stderr 是空的**） |
+
+> 📌 **记住：ncu 的一切都走 stdout**（`--log-file` 的默认值就是 `stdout`）。
+> 所以 `> 文件` 就能抓住全部；`2>` 基本抓不到东西。
+
+---
+
+### Q12. `ncu` 的报告怎么看？（三步法 + 逐段解析）
+
+**先记住三步判读法 —— 以后拿到任何报告都够用：**
+
+| 步骤 | 看哪 | 判断 |
+|---|---|---|
+| **第 1 步** | SOL 里的 `DRAM Throughput` vs `Compute (SM) Throughput` | **谁大谁就是瓶颈** |
+| **第 2 步** | `Compute Workload` 的 `Executed IPC` | < 0.5 → 严重等待；≈ 1.0 → 计算受限 |
+| **第 3 步** | `Warp State` 的 stall 原因 | 等 L1TEX → 访存瓶颈；等 barrier → 同步开销；等 ALU → 计算瓶颈 |
+
+#### 2.12.1 我的报告（N=2²⁶, block=256）
+
+**第 1 步：谁是瓶颈**
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| **DRAM Throughput** | **90.78 %** | 显存带宽用了九成 ← **瓶颈** |
+| Compute (SM) Throughput | 13.28 % | 算力只用了 13% |
+| L1/TEX Cache Throughput | 17.12 % | L1 很闲 |
+| L2 Cache Throughput | 21.34 % | L2 也很闲 |
+
+→ **内存受限（memory bound），而且是 DRAM 级别的受限。**
+
+**算一笔账，理解为什么必然如此：**
+
+```
+数据流量 = 读 a + 读 b + 写 c = 3 × 256 MiB = 805.3 MB
+计算量   = 67,108,864 次加法 = 67.1 MFLOP
+
+算术强度   = 67.1e6 ÷ 805.3e6 = 0.083 FLOP/Byte
+机器平衡点 = 9.5 TFLOP/s ÷ 255.4 GB/s = 37.2 FLOP/Byte
+
+37.2 ÷ 0.083 ≈ 448 倍
+```
+
+**我的 kernel 离平衡点差了 448 倍。**
+意思是：这台机器每搬 1 字节有能力做 37 次浮点运算，而这个 kernel 每搬 1 字节只做 0.083 次。
+**哪怕把加法优化到瞬发，耗时一点不会变。**
+
+> 这也解释了 Roofline 那句 `achieved close to 0% of fp32 peak` —— 不是写得差，是这个算子本身就只有这么点计算量。
+
+**第 2 步：IPC**
+
+| 指标 | 值 | 说明 |
+|---|---|---|
+| Executed IPC | **0.33** | 每周期只发射 0.33 条指令（上限 1.0） |
+| Issue Slots Busy | **8.31 %** | 96 个调度器 × 5,267,243 周期 = 5.06 亿个发射槽，只用了 4194 万个 |
+
+验算：`41,948,224 ÷ (5,267,243 × 96) = 8.30 %` ✅ 和报告一致。
+
+**第 3 步：warp 在等什么**
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| Warp Cycles Per Issued Instruction | **115.48** | 一个 warp 平均要等 115 周期才能发射下一条 |
+| 其中等 L1TEX | **108.6（94.0%）** | **94% 的等待是在等访存返回** |
+| Active Warps Per Scheduler | 9.60 | 有 9.6 个 warp 在场（"在编的工人"） |
+| Eligible Warps Per Scheduler | **0.09** | 只有 0.09 个准备好发射（"举起手的工人"） |
+| No Eligible | **91.68 %** | 91.68% 的周期里**一个举手的都没有** |
+
+**所以问题不是「warp 不够」，而是「在场的 warp 全都动不了」** —— 全线在等显存。
+
+**完整因果链：**
+
+```
+DRAM 90.78% 满载  ←── 瓶颈
+   ↑ 显存要 ~600 周期才把数据送回来
+   ↑ warp 发出 load 后只能干等（108.6 周期）
+   ↑ 调度器找不到 ready 的 warp（91.68% 的周期）
+   ↑ 算力只有 13.28%
+```
+
+**这不是 bug，这是带宽受限 kernel 的「正常体温」。**
+
+#### 2.12.2 剩下的指标
+
+| 指标 | 值 | 判断 |
+|---|---|---|
+| L1/TEX Hit Rate | **0 %** | **完全正确**，流式访问没有复用 |
+| L2 Hit Rate | 33.39 % | 三条流的结构性结果，不影响结论 |
+| Registers Per Thread | 16 | 很省 |
+| Theoretical Occupancy | 100 % | 受 `Block Limit Warps = 6` 限制（6×256=1536 线程=48 warps） |
+| Achieved Occupancy | 80.89 % | **在这里不是问题**（见下） |
+| Waves Per SM | 1820.44 | 1820 个整波 + 0.44 个残波 |
+| Branch Efficiency | 100 % | 没有分支发散 |
+| Avg. Active Threads Per Warp | 32 | 全员在岗 |
+
+#### 2.12.3 三条 WRN/INF 的判读（**哪些该听，哪些别听**）
+
+| 提示 | 该不该听 |
+|---|---|
+| **INF**：`utilizing greater than 80% ... Start by analyzing DRAM` | ✅ **对**，方向正确 |
+| **WRN**：`converting pairs of non-fused instructions to their fused ... could be increased by up to 50%` | ❌ **无效建议**。① 这个 kernel **没有乘法**，无乘可融；② 算力只占 13.28%，就算 FP32 效率提升 50% 也毫无用处 |
+| **WRN**：`each scheduler only issues an instruction every 12.0 cycles` | ✅ 描述准确，但它建议的解法（提高 eligible warp）在这里**无效** —— warp 是在**等显存**，不是在等调度 |
+| **WRN**：`achieved occupancy (80.9%) 低于 theoretical (100%)` | ⚠️ **在这里不构成问题**。占用率只在「延迟受限」时才重要；DRAM 已经跑满，再提高占用率也没用 |
+
+> 📌 **这是很重要的一堂课：profiler 给的是「通用建议」，不是「针对你的建议」。**
+> 它看到"有非融合的 FP32 指令"就条件反射地推荐 FMA，但它不知道你这个 kernel 是纯加法。
+> **读工具报告时，永远要用自己的物理常识过滤一遍。**
+
+#### 2.12.4 kernel 已经到顶了
+
+| 事实 | 数字 |
+|---|---|
+| DRAM 利用率 | 90.78% |
+| ncu 用的理论峰值 | 255.4 GB/s |
+| 实测流量 | 231.90 GB/s |
+
+**剩下的唯一小杠杆是 `float4` 向量化**（一个线程一次搬 16 字节），预期只能把 90.78% 推到 93~95%。
+
+> 这就是「贴着屋顶」的含义：**优化到 90% 以上之后，再想提升只能换算法，不能调参数。**
+
+---
+
 ## 3. 我犯过的错（按危险程度分级）
 
 > **为什么按危险程度分？**
@@ -903,9 +1098,151 @@ set_target_properties(my_vector_add PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 **一个 target 只能有一个入口。**
 
+### 3.6 内存管理类：**这是最值钱的一条**
+
+| # | 问题 | 后果 | 修法 |
+|---|---|---|---|
+| 26 | `h_c` 用 `malloc`，**从来没被 CPU 写过** | D2H 拷贝 134 ms（2.00 GB/s） | 换 `cudaHostAlloc` → **20.6 ms（13.06 GB/s）** |
+
+#### 3.6.1 现象：同一条 PCIe，两个方向差了 6.5 倍
+
+```
+改之前：
+HostToDevice copy :  56.71 ms   (512 MiB →  9.47 GB/s)
+DeviceToHost copy : 134.47 ms   (256 MiB →  2.00 GB/s)   ← 慢得离谱
+```
+
+**H2D 搬了两倍的数据，却只花 D2H 的 40% 时间** —— 这不可能来自带宽。
+
+#### 3.6.2 原因：`malloc` 的内存**没有落地**
+
+```cpp
+float* h_a = (float*)malloc(bytes);
+float* h_b = (float*)malloc(bytes);
+float* h_c = (float*)malloc(bytes);   // ← 从头到尾没人写过它
+float* ref = (float*)malloc(bytes);
+
+for(int i = 0; i < n; i++) { h_a[i] = 1.0f; h_b[i] = 2.0f; }   // ← h_a/h_b 被"落地"了
+```
+
+`malloc` 256 MiB 时 glibc 走 `mmap`。**操作系统只给你一段"看起来存在"的地址，并没有真的分配物理内存。**
+
+每个 4 KiB 页最初都指向同一个「零页」。**只有第一次写它时，CPU 才触发缺页中断（page fault）**，内核才真的分配物理页、清零、建映射。
+
+| 数组 | CPU 写过吗 | 页已落地吗 | 拷贝时要缺页吗 |
+|---|---|---|---|
+| `h_a` | ✅ 初始化循环 | 已落地 | 不用 |
+| `h_b` | ✅ 初始化循环 | 已落地 | 不用 |
+| **`h_c`** | ❌ **没人写过** | **没落地** | **要 65,536 次** |
+
+#### 3.6.3 验算：数字对得上
+
+```
+256 MiB ÷ 4 KiB/页 = 65,536 个页
+134.47 ms ÷ 65,536 = 2.05 µs / 页
+```
+
+**2 微秒一次缺页中断，正是操作系统的典型量级。**
+
+> 📌 一句话：**你测的不是"拷贝有多快"，而是"给 256 MiB 内存第一次落地要多久"。**
+
+#### 3.6.4 修法与效果
+
+```cpp
+// 申请：注意也是二级指针
+float* h_a;  float* h_b;  float* h_c;
+CUDA_CHECK(cudaHostAlloc(&h_a, bytes_per_vector, cudaHostAllocDefault));
+CUDA_CHECK(cudaHostAlloc(&h_b, bytes_per_vector, cudaHostAllocDefault));
+CUDA_CHECK(cudaHostAlloc(&h_c, bytes_per_vector, cudaHostAllocDefault));
+
+// 释放：不是 free()！
+CUDA_CHECK(cudaFreeHost(h_a));
+CUDA_CHECK(cudaFreeHost(h_b));
+CUDA_CHECK(cudaFreeHost(h_c));
+```
+
+| 阶段 | 改之前 | 改之后 | 提升 |
+|---|---|---|---|
+| H2D（512 MiB） | 56.71 ms / 9.47 GB/s | **43.04 ms / 12.47 GB/s** | +32 % |
+| kernel | 3.53 ms | 3.53 ms | **不变** |
+| D2H（256 MiB） | 134.47 ms / 2.00 GB/s | **20.56 ms / 13.06 GB/s** | **+553 %（6.5 倍）** |
+| **合计** | **194.7 ms** | **67.1 ms** | **快 2.90 倍** |
+
+**而 kernel 一行都没改，带宽稳定在 227.95 vs 228.15 GB/s（噪声内）。**
+
+#### 3.6.5 这一课的价值
+
+> 我花了大量精力把 kernel 优化到 96% 峰值，程序一分钱没快。
+> 我把 `malloc` 换成 `cudaHostAlloc`（6 行），程序快了 **2.9 倍**。
+
+而且：**只有锁页内存才能做真正的异步拷贝**（`cudaMemcpyAsync` 对可分页内存是「假异步」）。
+所以这是后面学 **streams / 双缓冲 / 流水线** 的前置条件。
+
+| | `malloc`（可分页） | `cudaHostAlloc`（锁页） |
+|---|---|---|
+| 缺页中断 | **会** | **不会** |
+| D2H 带宽 | 2.0 GB/s | **13.1 GB/s** |
+| H2D 带宽 | 9.5 GB/s | **12.5 GB/s** |
+| 代价 | 无 | 占用物理内存、不能 swap、申请慢 |
+| 适用 | 普通数据 | **要频繁和 GPU 交换的数据** |
+
+### 3.7 目录结构类：产物放错了层级
+
+| # | 问题 | 后果 | 修法 |
+|---|---|---|---|
+| 27 | 把 ncu 日志放到了 `cuda_basic/logs/` | 它和 `cuda_basic/vector_add/` **同级**，但装的全是 vector_add 的报告 | 挪到 `cuda_basic/vector_add/logs/` |
+
+#### 3.7.1 错在哪
+
+```
+cuda_basic/
+├── CMakeLists.txt
+├── build/              ← 编译产物
+├── hello_cuda/         ← 练习 1
+├── logs/               ← ❌ 和练习目录同级
+│   └── ncu/            ←    但里面装的是 vector_add 的报告
+└── vector_add/         ← 练习 2
+```
+
+**两个问题：**
+
+1. **以后会糊成一团**：再加 `reduction`、`sgemm`，它们的 ncu 报告会全挤进同一个 `cuda_basic/logs/ncu/`，
+   文件名还都叫 `vadd_b256` 这种，**分不清哪个属于谁**
+2. **删不干净**：`rm -rf vector_add/` 之后，它的日志还孤零零躺在外面
+
+#### 3.7.2 正确结构
+
+```
+cuda_basic/
+├── CMakeLists.txt
+├── build/
+├── hello_cuda/
+│   └── logs/           ← 练习 1 的产物
+└── vector_add/
+    ├── vector_add.cu
+    ├── my_vector_add.cu
+    ├── my_vector_add_notes.md
+    ├── bash_orders/    ← 命令速查
+    └── logs/           ← ✅ 练习 2 的产物
+        └── ncu/
+            └── vadd_b256.ncu-rep
+```
+
+#### 3.7.3 一条通用规则
+
+> **产物跟着它所属的「练习 / 模块」走，不要放到工程根目录。**
+
+| 类型 | 放哪 | 为什么 |
+|---|---|---|
+| 编译产物 | `cuda_basic/build/bin/` **集中** | CMake 统一管理，而且 `build/` 整个被 gitignore |
+| **实验数据**（ncu 报告、日志、CSV） | **各练习自己的 `logs/`** | 跟着模块走，删的时候一锅端 |
+
+> ⚠️ 这和「`build/bin` 集中放二进制」并不矛盾 ——
+> 二进制是**构建系统**的产物（CMake 说了算），实验数据是**你**的产物（你自己组织）。
+
 ---
 
-## 4. 必须记住的 7 条铁律
+## 4. 必须记住的 9 条铁律
 
 ### 铁律 1：只看第一个报错
 
@@ -951,11 +1288,18 @@ cudaEventXxx(event)   →  带参数
 cudaDeviceXxx()       →  不带参数
 ```
 
-### 铁律 6：超过硬件峰值的数字 = 代码 bug
+### 铁律 6：超过硬件峰值的数字 = 代码 bug（但有个前提）
 
-- 带宽上限：**256.3 GB/s**
+- 带宽上限：**256.3 GB/s**（DRAM）
 - 算力上限：**9.5 TFLOP/s**
 - 看到一个「太圆」（如 `1.0000`）的数字，先怀疑它是初值
+
+> ⚠️ **前提：只有当工作集远大于 L2 缓存（本机约 24 MiB）时，「带宽不得超过 DRAM 峰值」才成立。**
+>
+> 实测：`N = 2²⁰` 时三个数组才 12 MiB，**整个装进 L2**，测出来 `kernel bandwith: 733.61 GB/s` ——
+> 超过 DRAM 峰值 2.9 倍，但**这不是 bug**，因为数据压根没怎么访问显存。
+>
+> **怎么区分**：跑 `N = 2²⁶`（768 MiB，一定超出 L2）对比。掉回 ~245 GB/s 就说明是缓存效应。
 
 ### 铁律 7：限流与计数分开
 
@@ -969,18 +1313,52 @@ bad++;                      // 计数：无条件执行，只影响数字
 - **两者别塞进同一个 `if`**，否则数字会失真
 - 想「提前停止扫描」要用 `break`，但那样会丢掉「错了多少」这个关键线索 —— **限流就够了，不必早停**
 
+### 铁律 8：要和 GPU 交换的内存，必须用 `cudaHostAlloc`
+
+```cpp
+float* h_c;
+CUDA_CHECK(cudaHostAlloc(&h_c, bytes, cudaHostAllocDefault));   // ✅ 锁页
+// CUDA_CHECK(cudaFreeHost(h_c));   // 释放用 cudaFreeHost，不是 free()
+```
+
+- `malloc` 的页**没有落地**，第一次写要付**缺页中断**（~2 µs/页）
+- 256 MiB 就是 **65,536 次缺页 ≈ 134 ms**
+- 换成锁页后同样一次拷贝只要 **20.6 ms**（6.5 倍）
+- **而且只有锁页内存才能做真正的异步拷贝** → streams / 双缓冲的前提
+
+> 症状识别：**同一条 PCIe 链路，H2D 和 D2H 带宽差 3 倍以上** → 一定是缺页，不是带宽。
+
+### 铁律 9：`ncu` 只看得见 kernel
+
+```
+ncu 的视野：
+        ┌──────────────────────┐
+        │   kernel  3.5 ms     │  ← ncu 只看得到这里
+        └──────────────────────┘
+  H2D 43 ms  │  CPU 参考 ~? │  D2H 134 ms   ← ncu 完全看不见
+```
+
+- 我的程序总耗时 194.7 ms，**kernel 只占 1.81%**
+- 把 kernel 从 90.78% 优化到 100%，整个程序只能快 **0.17%**
+- 而那 134 ms 的 D2H，是**自己的计时代码 + 一个"这个数字不对劲"的直觉**发现的
+
+**所以：`ncu` 是显微镜，但你还需要一把尺子去量整个程序。**
+
 ---
 
 ## 5. 当前仍未修复的问题（TODO）
 
 | # | 位置 | 问题 | 影响 | 优先级 |
 |---|---|---|---|---|
-| 1 | `bad++` 的缩进 | 还在 `if(bad < 5)` 里面 | PASS/FAIL 判定**仍正确**，但打印的错误数**失真**（永远显示 5） | ★★ |
-| 2 | `bw_HTD` / `bw_DTH` | 算了没打印 | 传输带宽看不到 | ★★ |
-| 3 | 缺少峰值自检 | 没有 `if (bw > 260) WARN` | 下次还会被假数据骗 | ★★ |
-| 4 | `mismathch` / `bandwith` | 拼写 | 只影响 grep | ★ |
-| 5 | `FAILURE` vs `PASS` | 不统一 | 只影响观感 | ★ |
-| 6 | `bw` 命名 | 应改 `bw_kernel` | 只影响可读性 | ★ |
+| 1 | `ref` 还是 `malloc`（第 50 行） | 唯一剩下的可分页内存 | `vectorAddHost` 写 `ref` 要付 **65,536 次缺页**（~130 ms） | ★★★ |
+| 2 | CPU 参考实现没有计时 | 搜 `chrono` 一个都没有 | 程序里还有一块**完全没被测量**的开销，可能是最大的一块 | ★★★ |
+| 3 | `bad++` 的缩进 | 还在 `if(bad < 5)` 里面 | PASS/FAIL 判定**仍正确**，但打印的错误数**失真** | ★★ |
+| 4 | 缺少峰值自检 | 没有 `if (bw > 260) WARN` | 下次还会被假数据骗 | ★★ |
+| 5 | Notebook 的 awk 解析 | 输出格式变了（`kernel bandwith:` / `bandweight:` 两行都以 `HostToDevice` 开头） | 批量实验结果**静默出错** | ★★ |
+| 6 | `mismathch` / `bandwith` / `bandweight` | 拼写 | 只影响 grep | ★ |
+| 7 | `FAILURE` vs `PASS` | 不统一 | 只影响观感 | ★ |
+
+> ✅ 已解决：`bw_HTD` / `bw_DTH` 现在都打印了。
 
 ---
 
@@ -997,6 +1375,11 @@ bad++;                      // 计数：无条件执行，只影响数字
 | 5 | N 取 `1<<26 + 3` | 验证「grid 向上取整 + 边界判断」是否正确 |
 | 6 | block 扫描 128 / 256 / 512 / 1024 | 复现 245.8 GB/s（block=1024）；理解为什么 block 越大越好（启动的 block 数少 → 尾波更小） |
 | 7 | 用 `std::chrono` 对照测 memcpy | 体会「用户等多久」≠「硬件忙多久」 |
+| 8 | `ref` 也换成 `cudaHostAlloc` | 消掉最后一处缺页 |
+| 9 | 用 `std::chrono` 给 `vectorAddHost` 计时 | 找出程序里**最后一块没测过**的开销 |
+| 10 | 同一份代码跑 `N=2²⁰` vs `N=2²⁶` | 直观感受 **L2 缓存 vs DRAM** 的量级差（733 GB/s vs 245 GB/s） |
+| 11 | 分块 + 双流异步（方向 A） | 学 `cudaMemcpyAsync` + `cudaStream_t` + 重叠。是后面所有流水线的地基 |
+| 12 | 开始 **reduction 归约**（方向 B，**推荐**） | 第一个需要 `__shared__` + `__syncthreads()` + warp shuffle 的 kernel |
 
 **实验 6 的参考命令：**
 
@@ -1032,8 +1415,20 @@ rm -rf build && cmake -S . -B build && cmake --build build
 # 非整除边界测试
 ./build/bin/my_vector_add $((1<<26)+3) 512
 
-# 性能分析
-ncu --set full -k vectorAdd --launch-count 1 ./build/bin/my_vector_add
+# 性能分析（导出报告 + 文本日志）
+# ⚠️ 产物放 vector_add/logs/，不要放 cuda_basic/logs/（见 3.7）
+LOGDIR=vector_add/logs
+mkdir -p "$LOGDIR/ncu"
+ncu --set full -k vectorAdd --launch-count 1 -f \
+    -o "$LOGDIR/ncu/vadd_b256" --log-file "$LOGDIR/ncu/vadd_b256.log" \
+    ./build/bin/my_vector_add $((1<<26)) 256
+
+# 看报告（带 -o 时 ncu 不再往终端打正文）
+ncu --import "$LOGDIR/ncu/vadd_b256.ncu-rep" --page details
+ncu-ui "$LOGDIR/ncu/vadd_b256.ncu-rep"     # 图形界面
+
+# 查 PCIe 链路（算传输理论上限）
+nvidia-smi --query-gpu=name,pcie.link.gen.current,pcie.link.width.current --format=csv
 ```
 
 ### 7.2 本机预期基准数据
@@ -1044,11 +1439,21 @@ ncu --set full -k vectorAdd --launch-count 1 ./build/bin/my_vector_add
 | N=2²⁶, block=256 | ~3.528 ms | ~228.3 GB/s | 89% |
 | N=2²⁶, block=512 | ~3.523 ms | ~228.6 GB/s | 89% |
 | **N=2²⁶, block=1024** | **~3.276 ms** | **~245.8 GB/s** | **96%** |
-| H2D 拷贝（512 MiB） | ~45 ms | ~12 GB/s | — |
-| D2H 拷贝（256 MiB） | ~22 ms | ~12 GB/s | — |
 
-> **最该记住的一行**：kernel 只占整个程序 ~3% 的时间，其余 97% 都在搬数据。
-> 这就是推理框架里做「算子融合 / 减少数据搬运」能带来巨大收益的原因。
+**传输基准（实测）：**
+
+| 阶段 | 可分页 `malloc` | 锁页 `cudaHostAlloc` | 理论上限 |
+|---|---|---|---|
+| H2D（512 MiB） | 56.71 ms / 9.47 GB/s | **43.04 ms / 12.47 GB/s** | 15.75 GB/s |
+| D2H（256 MiB） | **134.47 ms / 2.00 GB/s** ⚠️ | **20.56 ms / 13.06 GB/s** | 15.75 GB/s |
+| **程序总耗时** | **194.7 ms** | **67.1 ms（快 2.90×）** | — |
+
+> ⚠️ 可分页那一行的 D2H 之所以是 134 ms，**不是带宽问题，是缺页中断**（见 3.6）。
+> 改完之后两个方向都到了 PCIe 理论值的 **79~83%** —— 传输这条路到顶了。
+
+> **最该记住的两行**：
+> 1. **kernel 只占整个程序 1.8~5.3% 的时间，其余 95% 都在搬数据。**
+> 2. **同一条 PCIe，H2D 和 D2H 带宽差 3 倍以上 → 一定是缺页，不是带宽。**
 
 ### 7.3 写下一个 kernel（reduction）前的自检清单
 
@@ -1063,6 +1468,9 @@ ncu --set full -k vectorAdd --launch-count 1 ./build/bin/my_vector_add
 - [ ] 浮点比较是「先减 → 再取绝对值 → 再比容差」吗？
 - [ ] 限流的 `if` 和计数的 `++` 分开了吗？
 - [ ] 最后算出来的数字有没有超过硬件峰值？
+- [ ] 要和 GPU 交换的 host 内存用了 `cudaHostAlloc` 吗？（不是 `malloc`）
+- [ ] 程序里每个阶段都计时了吗？（包括 CPU 参考实现）
+- [ ] kernel 耗时占整个程序多少？如果 < 10%，优化 kernel 是白费力气
 
 ---
 
@@ -1074,3 +1482,22 @@ ncu --set full -k vectorAdd --launch-count 1 ./build/bin/my_vector_add
 > 但真正值钱的是那 **3 个沉默 bug** —— 它们教会我的一件事是：
 > **代码能编译、能跑完、还打印 PASS，不代表你的结论是对的。**
 > 只有主动质疑数据（「这个数字物理上可能吗？」「它会不会是初值？」），才能发现它们。
+>
+> ---
+>
+> **而最值钱的一课，发生在所有代码都写对之后：**
+>
+> | 我做的事 | 改动量 | 程序提速 |
+> |---|---|---|
+> | 把 kernel 从 89% 优化到 96% 峰值带宽 | 大量 | ~0 % |
+> | 把 `malloc` 换成 `cudaHostAlloc` | **6 行** | **2.90 倍** |
+>
+> 我的程序跑了 194.7 ms，**kernel 只占 1.8%**。
+> 剩下的 98% 里，有一大块是**内存第一次落地**要付的缺页中断。
+>
+> **`ncu` 是显微镜 —— 但它只看 kernel。**
+> 真正发现那 134 ms 的，是我自己写的计时器，和一个「这个数字不对劲」的直觉。
+>
+> > **先量，再猜。**
+> > 不要因为一个数字「看起来正常」就相信它 ——
+> > `2.00 GB/s` 看起来只是个「有点慢的数」，实际是 **6.5 倍**的性能损失。
