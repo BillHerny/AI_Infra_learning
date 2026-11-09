@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+miniddp/__init__.py
+miniddp/comm.py
+miniddp/ddp.py
+miniddp/launch.py
+miniddp/reducer.py
+miniddp_from_scratch.egg-info/PKG-INFO
+miniddp_from_scratch.egg-info/SOURCES.txt
+miniddp_from_scratch.egg-info/dependency_links.txt
+miniddp_from_scratch.egg-info/top_level.txt
+tests/test_compare.py

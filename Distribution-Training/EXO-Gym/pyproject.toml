@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miniddp-from-scratch"
+version = "0.1.0"
+description = "A minimal from-scratch DDP implementation for learning distributed training internals"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["miniddp*"]

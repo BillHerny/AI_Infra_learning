@@ -1,0 +1,10 @@
+# Install torch/torchvision separately with the CUDA index matching your driver.
+# Example for this machine (RTX 4060, driver 610.74):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+torch>=2.0
+torchvision>=0.15
+numpy
+pandas
+matplotlib
+pytest
+tqdm

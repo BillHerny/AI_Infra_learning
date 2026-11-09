@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: miniddp-from-scratch
+Version: 0.1.0
+Summary: A minimal from-scratch DDP implementation for learning distributed training internals
+Requires-Python: >=3.10

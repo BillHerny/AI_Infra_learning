@@ -4,6 +4,9 @@
     "folders": [
         {
             "path": "cuda_basic"
+        },
+        {
+            "path": "Distirbution-Training"
         }
     ],
     // 以后新增平级项目时，在这里追加，例如：

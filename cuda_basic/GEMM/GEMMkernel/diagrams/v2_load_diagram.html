@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>V2 smem：A / B 两条载入语句图解</title>
+<style>
+  :root{
+    --ink:#0f172a; --muted:#64748b; --line:#dbe2ea; --bg:#f8fafc;
+    --a:#1d4ed8; --a-bg:#dbeafe; --a-bd:#93c5fd;
+    --b:#b45309; --b-bg:#fef3c7; --b-bd:#fcd34d;
+    --s:#047857; --s-bg:#d1fae5; --s-bd:#6ee7b7;
+    --k:#6d28d9; --k-bg:#ede9fe; --k-bd:#c4b5fd;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:30px 34px 70px;background:var(--bg);color:var(--ink);
+       font:15px/1.68 -apple-system,"Segoe UI","Noto Sans SC","Microsoft YaHei",sans-serif;
+       max-width:1180px;}
+  h1{font-size:23px;margin:0 0 4px}
+  h2{font-size:18px;margin:46px 0 12px;padding-left:11px;border-left:5px solid var(--a)}
+  h2.b{border-left-color:var(--b)}
+  h2.s{border-left-color:var(--s)}
+  .sub{color:var(--muted);margin:0 0 10px;font-size:14px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:12px 0;
+        box-shadow:0 1px 2px rgba(15,23,42,.05)}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  code{background:#eef2ff;color:#3730a3;padding:1px 5px;border-radius:4px;font-size:13.5px}
+  pre{background:#0f172a;color:#e2e8f0;padding:11px 14px;border-radius:8px;overflow:auto;
+      font-size:13px;line-height:1.6;margin:8px 0}
+  pre .c{color:#7c8ba1}
+  pre .hl{color:#fbbf24}
+
+  .grid{display:grid;gap:2px}
+  .cell{width:15px;height:15px;border-radius:3px;background:#eef2f7;border:1px solid #e2e8f0;flex:0 0 auto}
+  .cell.a{background:var(--a-bg);border-color:var(--a-bd)}
+  .cell.b{background:var(--b-bg);border-color:var(--b-bd)}
+  .cell.s{background:var(--s-bg);border-color:var(--s-bd)}
+  .cell.on{background:var(--a);border-color:var(--a)}
+  .cell.a.on{background:var(--a);border-color:var(--a)}
+  .cell.b.on{background:var(--b);border-color:var(--b)}
+  .cell.s.on{background:var(--s);border-color:var(--s)}
+  .cell.ring{outline:2px solid #0f172a;outline-offset:1px}
+  .cell.gap{background:transparent;border:none}
+
+  .bar{display:flex;align-items:center;gap:2px;margin:3px 0}
+  .bar .ell{color:#94a3b8;font-size:12px;padding:0 1px;flex:0 0 auto}
+  .rowlabel{display:flex;align-items:center;gap:10px;margin:3px 0}
+  .rowlabel > .tag{width:118px;flex:0 0 auto;text-align:right;font-size:12.5px;color:var(--muted)}
+  .rowlabel > .tag.hot{color:var(--a);font-weight:700}
+
+  .lane{display:flex;gap:2px;margin-top:8px}
+  .lane .tick{width:15px;flex:0 0 auto;text-align:center;font-size:9.5px;color:#94a3b8}
+  .axis{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:2px}
+
+  .note{border-left:4px solid var(--a);background:#eff6ff;padding:10px 14px;border-radius:0 8px 8px 0;margin:14px 0;font-size:14px}
+  .note.warn{border-left-color:#dc2626;background:#fef2f2}
+  .note.ok{border-left-color:var(--s);background:#ecfdf5}
+  .note b{font-weight:700}
+  .kv{display:flex;gap:26px;flex-wrap:wrap;margin-top:8px}
+  .kv > div{font-size:13.5px;color:var(--muted)}
+  .kv b{color:var(--ink)}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#f1f5f9;font-weight:600}
+  td.mono,th.mono{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+  .arrow{font-size:22px;color:#94a3b8;padding:0 12px;flex:0 0 auto}
+  .flowrow{display:flex;align-items:center;flex-wrap:wrap}
+  .stack{display:flex;flex-direction:column;gap:4px}
+  .tilewrap{display:inline-block;margin-top:6px}
+  .capa{font-size:12.5px;color:var(--muted);margin-top:6px}
+  .pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;background:#e0e7ff;color:#3730a3;margin-right:6px}
+</style>
+</head>
+<body>
+
+<h1>GEMMkernel_v2_smem：两条载入语句的数据流</h1>
+<p class="sub">以 2048×2048×2048、block(32×32)、<code>block(bx=0, by=1)</code>、<code>kt=0</code> 为例。一个格子 = 一个 float。</p>
+
+<div class="card">
+  <div class="mono" style="font-size:13.5px;line-height:2">
+    <div><span class="pill">约定</span> block<b>(bx, by)</b> = blockIdx<b>(x, y)</b>；thread<b>(tx, ty)</b> = threadIdx<b>(x, y)</b></div>
+    <div><span class="pill">坐标</span> i = blockIdx.y·blockDim.y + threadIdx.y = by·32 + ty &nbsp;→&nbsp; C 的<b>行</b></div>
+    <div><span class="pill">坐标</span> j = blockIdx.x·blockDim.x + threadIdx.x = bx·32 + tx &nbsp;→&nbsp; C 的<b>列</b></div>
+    <div><span class="pill">举例</span> block(<b>bx=0, by=1</b>) 的 thread(<b>tx=5, ty=3</b>)：</div>
+    <div style="padding-left:56px">i = <b>1</b>·32 + <b>3</b> = 35 &nbsp;&nbsp; j = <b>0</b>·32 + <b>5</b> = 5 &nbsp;→&nbsp; 负责 <b>C[35][5]</b></div>
+    <div style="padding-left:56px;color:#64748b;font-size:12.5px">by=1 表示从第 32 行开始的那一条「行带」，带内再走 ty=3 行 → 第 35 行</div>
+    <div style="padding-left:56px;color:#64748b;font-size:12.5px">bx=0 表示第 0 条「列带」（第 0..31 列），带内再走 tx=5 列 → 第 5 列</div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 图 1 ══════════════════════ -->
+<h2>图 1 ｜ 一个 block 认领 C 的 32×32 小块，一条 warp 就是一整行</h2>
+<p class="sub">因为 <code>blockDim.x == 32</code>，warp 内 <code>tx = 0..31</code> 填满、<code>ty 固定</code> —— 这条性质后面所有合并访问都靠它。</p>
+
+<div class="card">
+  <div class="tilewrap">
+    <div class="grid tile" data-n="32" data-kind="" data-hlrow="3" data-ring="3,5"></div>
+  </div>
+  <div class="axis" style="width:542px">
+    <span>← tx = 0</span><span>tx = 31 →（即 j = col0 + tx）</span>
+  </div>
+  <div class="capa">纵轴 ty = 0..31（即 i = row0 + ty）。<b>蓝 = warp ty=3 负责的那一整行 C</b>；<b>黑框 = thread(5,3) 负责的 C[35][5]</b>。</div>
+</div>
+
+<!-- ══════════════════════ 图 2 ══════════════════════ -->
+<h2>图 2 ｜ 载入 A 片：<code style="font-size:14px">As[ty][tx] = m1[i*K + kt + tx]</code></h2>
+<p class="sub">warp 内 <b>tx 走的是 k 方向</b>，<b>ty 定死了 A 的哪一行</b>。</p>
+
+<div class="card">
+  <div class="rowlabel">
+    <div class="tag">row i−1</div>
+    <div class="bar" data-kind="a" data-on="0"></div>
+  </div>
+  <div class="rowlabel">
+    <div class="tag hot">row i = row0+ty = 35</div>
+    <div class="bar" data-kind="a" data-on="1"></div>
+  </div>
+  <div class="rowlabel">
+    <div class="tag">row i+1</div>
+    <div class="bar" data-kind="a" data-on="0"></div>
+  </div>
+  <div class="capa" style="margin-left:128px">
+    这一段就是 <code>m1 + i*K + kt</code> 开始的 32 个连续 float。<b>深蓝 32 格 = warp(ty=3) 的 32 个 lane 各自搬的那 1 个</b>：
+    lane <code>tx</code> 搬第 <code>tx</code> 格。<br/>
+    它上面 / 下面的两行（浅蓝）<b>不是这个 warp 的活</b>，由 ty=2 / ty=4 的 warp 负责。
+  </div>
+</div>
+
+<div class="card">
+  <div class="mono" style="font-size:13px;color:#334155">同一条 warp 指令（LDG.32）里 32 个 lane 的地址：</div>
+  <div class="lane" id="laneA"></div>
+  <pre>lane tx :  0     1     2    ...   31
+地址     : m1[i*K+kt+0] ... m1[i*K+kt+31]      <span class="hl">← 32 个连续 float</span>
+         └──────────── 128 B = 1 次合并事务 ────────────┘</pre>
+  <div class="note ok"><b>所以「一次取出 32 个 float」不是单个线程的能力，而是 32 个线程合力 + 硬件合并：</b>
+  每条 <code>LDG.32</code> 只搬 4 B，但 32 个 lane 的地址连续 → 硬件合成 1 次 128 B 事务。</div>
+</div>
+
+<div class="flowrow" style="gap:10px">
+  <div class="stack">
+    <div class="capa" style="margin:0 0 4px"><b>warp(ty=3)</b> 搬完 → 写出 <code>As</code> 的第 3 行</div>
+    <div class="grid tile" data-n="32" data-kind="a" data-hlrow="3" data-ring="3,5"></div>
+  </div>
+  <div class="arrow">⤴</div>
+  <div class="stack" style="font-size:13.5px">
+    <div>32 条 warp（ty = 0..31）各搬一行</div>
+    <div>→ 拼满整片 <code>As[32][32]</code> = 1024 个数 = 4 KB</div>
+    <div style="color:var(--muted)">而且写入坐标就是读取坐标，<b>没有转置</b>：</div>
+    <div class="mono" style="font-size:13px;background:#f1f5f9;padding:8px 10px;border-radius:6px">
+      As[ty][tx] ← A[row0+ty][kt+tx]
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 图 3 ══════════════════════ -->
+<h2 class="b">图 3 ｜ 载入 B 片：<code style="font-size:14px">Bs[ty][tx] = m2[(kt + ty)*N + j]</code></h2>
+<p class="sub">这里 <b>ty 变的是 k 方向</b>，<b>tx 走的是列 j 方向</b> —— 跟 A 那次正好互换，但「一条 warp 搬一整行」的结构完全一样。</p>
+
+<div class="card">
+  <div class="rowlabel">
+    <div class="tag">row kt+ty−1</div>
+    <div class="bar" data-kind="b" data-on="0"></div>
+  </div>
+  <div class="rowlabel">
+    <div class="tag hot" style="color:var(--b)">row kt+ty = 3</div>
+    <div class="bar" data-kind="b" data-on="1"></div>
+  </div>
+  <div class="rowlabel">
+    <div class="tag">row kt+ty+1</div>
+    <div class="bar" data-kind="b" data-on="0"></div>
+  </div>
+  <div class="capa" style="margin-left:128px">
+    这一段就是 <code>m2 + (kt+ty)*N + col0</code> 开始的 32 个连续 float（B 的第 3 行、第 col0..col0+31 列）。<br/>
+    <b>深橙 32 格 = warp(ty=3) 的 32 个 lane 各自搬的那 1 个</b>：lane <code>tx</code> 搬第 <code>tx</code> 格。
+  </div>
+</div>
+
+<pre>lane tx :  0            1          ...            31
+地址     : m2[(kt+ty)*N + col0 + 0] ... m2[(kt+ty)*N + col0 + 31]
+           <span class="c">└──────── 同一个 k（行固定）────────┘</span>
+           <span class="hl">32 个连续 float → 128 B 1 次合并</span></pre>
+
+<div class="note warn">
+  <b>关键：载入阶段根本没有线程去「取 B 的一列」。</b><br/>
+  每个线程只负责 B 片里的<b>一格</b> <code>(row = kt+ty, col = col0+tx)</code>；<br/>
+  而某个线程计算时需要的那一<b>列</b>（32 个不同 k），是后来<b>在 smem 里</b>被拼出来的 —— 见 <b>图 4</b>。
+</div>
+
+<div class="flowrow" style="gap:10px">
+  <div class="stack">
+    <div class="capa" style="margin:0 0 4px"><b>warp(ty=3)</b> 搬完 → 写出 <code>Bs</code> 的第 3 行</div>
+    <div class="grid tile" data-n="32" data-kind="b" data-hlrow="3" data-ring="3,5"></div>
+  </div>
+  <div class="arrow">⤴</div>
+  <div class="stack" style="font-size:13.5px">
+    <div>32 条 warp（ty = 0..31，各自对应一个 k）各搬一行</div>
+    <div>→ 拼满整片 <code>Bs[32][32]</code> = 4 KB</div>
+    <div style="color:var(--muted)">同样没有转置：</div>
+    <div class="mono" style="font-size:13px;background:#f1f5f9;padding:8px 10px;border-radius:6px">
+      Bs[ty][tx] ← B[kt+ty][col0+tx]
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 图 3b ══════════════════════ -->
+<h2 class="b">图 3b ｜ thread(tx=5) 需要的那一列，是谁搬来的？</h2>
+<p class="sub">列 <code>tx = 5</code> 的 32 个格子，来自 <b>32 条不同的 warp</b>（ty = 0..31），共同点是它们都用了 <code>tx = 5</code> 这条 lane。</p>
+
+<div class="card flowrow" style="gap:20px">
+  <div>
+    <div class="grid tile" data-n="32" data-kind="b" data-hlcol="5"></div>
+    <div class="capa">竖着那一列（深橙）= <code>Bs[0..31][5]</code><br/>= B[kt+0..kt+31][col0+5] = 计算时 thread(tx=5) 要用的 32 个数</div>
+  </div>
+  <div style="font-size:13.5px;line-height:2">
+    <div>∙ <code>Bs[0][5]</code> ← warp ty=0 的 lane tx=5</div>
+    <div>∙ <code>Bs[1][5]</code> ← warp ty=1 的 lane tx=5</div>
+    <div>∙ …</div>
+    <div>∙ <code>Bs[31][5]</code> ← warp ty=31 的 lane tx=5</div>
+    <div style="color:var(--muted);margin-top:8px;font-size:13px">每个 warp 提供的都是「一行里连续 32 格」中的一格，<br/>所以合并性一点没损失，列却被凑齐了。</div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 图 4 ══════════════════════ -->
+<h2 class="s">图 4 ｜ 计算阶段：列式的读取发生在 smem，不在 DRAM</h2>
+<p class="sub"><code>acc += As[ty][k] * Bs[k][tx]</code>（k = 0..31）。同一时刻（固定 k）看 warp 内 32 个 lane 读什么：</p>
+
+<div class="card flowrow" style="gap:44px;align-items:flex-start">
+  <div>
+    <div class="capa" style="margin:0 0 6px"><b>A：32 个 lane 读同一格 → 广播</b></div>
+    <div class="grid tile" data-n="32" data-kind="s" data-ring="3,5"></div>
+    <div class="capa" style="width:542px">
+      <code>As[ty][k]</code>：warp 内 <code>ty</code> 固定、<code>k</code> 固定 → <b>1 个地址</b>，硬件广播给 32 个 lane，<b>1 个事务</b>
+    </div>
+  </div>
+  <div>
+    <div class="capa" style="margin:0 0 6px"><b>B：32 个 lane 读连续一整行 → 无冲突</b></div>
+    <div class="grid tile" data-n="32" data-kind="s" data-hlrow="5"></div>
+    <div class="capa" style="width:542px">
+      <code>Bs[k][tx]</code>：<code>k</code> 固定、<code>tx = 0..31</code> → 地址 <code>k*32 + 0..31</code> → <b>32 个不同 bank</b>，零冲突
+    </div>
+  </div>
+</div>
+
+<div class="note ok">
+  <b>「一个线程要读 B 的一列」并不慢，因为你算的账算错了维度。</b><br/>
+  bank / 合并这些开销是<b>按指令</b>算的，不是按「某个线程随时间走的路」算的：
+  <ul style="margin:6px 0 0 0">
+    <li>固定 <code>k</code> 的那一条 LDS，warp 内读的是<b>连续 32 格</b> → 1 个 wavefront，完美；</li>
+    <li>k 从 0 变到 31，只是<b>下一条指令</b>换到下一行 —— 每条指令都各自完美。</li>
+  </ul>
+  真正会吃亏的是「<b>同一条指令里</b>地址跨 cache line」，那发生在 global，不发生在 smem。
+</div>
+
+<!-- ══════════════════════ 图 5 ══════════════════════ -->
+<h2 class="b">图 5 ｜ 反例：如果硬要让 tx 去走 k 方向</h2>
+<p class="sub">假设写成 <code>Bs[tx][ty] = m2[(kt + tx)*N + col0 + ty]</code>，warp 内 <code>tx</code> 变成 k → 地址步长变成 <code>N</code> 个字。</p>
+
+<pre>lane tx :   0        1        2      ...     31
+地址     : row kt  row kt+1 row kt+2  ...  row kt+31     <span class="hl">← 每个 lane 落在不同的 cache line</span>
+           │        │        │               │
+           └ 32 次独立的 32 B sector 请求，每次只用 4 B ┘
+           有效字节 128 B / 实际搬运 1024 B = <span class="hl">效率 12.5%</span>
+</pre>
+
+<div class="note warn">
+  这才是「行主序导致取列取不动」的真正症状 —— 而 V2 通过「<b>重新分工谁搬哪一格</b>」把它绕开了：
+  <b>搬运按行（合并友好），消费按列（bank 友好），中间的转换交给 smem。</b>
+</div>
+
+<!-- ══════════════════════ 汇总 ══════════════════════ -->
+<h2>汇总 ｜ 两条语句的对照</h2>
+<table>
+  <tr><th style="width:34%"></th><th>A 片载入</th><th>B 片载入</th></tr>
+  <tr><td>语句</td><td class="mono">As[ty][tx] = m1[i*K + kt + tx]</td><td class="mono">Bs[ty][tx] = m2[(kt+ty)*N + j]</td></tr>
+  <tr><td>warp 内 <code>tx</code> 走的方向</td><td><b>k</b>（A 的列，行内连续）</td><td><b>j</b>（B 的列，行内连续）</td></tr>
+  <tr><td>warp 内固定不变的是</td><td><code>i = row0+ty</code> → 定死 A 的哪一行</td><td><code>kt+ty</code> → 定死 B 的哪一行</td></tr>
+  <tr><td>一条 warp 指令搬多少</td><td>128 B 连续（1 次合并事务）</td><td>128 B 连续（1 次合并事务）</td></tr>
+  <tr><td>一条 warp 搬满</td><td><code>As</code> 的<b>一行</b>（32 个数）</td><td><code>Bs</code> 的<b>一行</b>（32 个数）</td></tr>
+  <tr><td>32 条 warp 合起来</td><td><code>As[32][32]</code> = 4 KB</td><td><code>Bs[32][32]</code> = 4 KB</td></tr>
+  <tr><td>是否转置</td><td>否</td><td>否</td></tr>
+  <tr><td>每线程每段搬几个</td><td>1 个（1024 线程 = 1024 格，<b>不需要循环</b>）</td><td>1 个（同上）</td></tr>
+  <tr><td>「取列」发生在哪</td><td colspan="2">都在<b>计算段的 smem 读取</b>：<code>As[ty][k]</code> 广播、<code>Bs[k][tx]</code> 连续，均无冲突</td></tr>
+</table>
+
+<div class="note">
+  <b>一句话：</b>DRAM 只知道线性地址 —— 「行主序」是你用 <code>k*N + j</code> 这个下标表达式赋予它的含义。
+  两条语句都刻意让 <code>tx</code>（warp 内连续变化的那一维）去走<b>矩阵的行内方向</b>，
+  于是搬运阶段 100% 合并；需要的那一列由 32 条 warp 在 smem 里拼出来，转置是白拿的。
+</div>
+
+<script>
+(function(){
+  function cell(cls){ var d=document.createElement('div'); d.className='cell '+(cls||''); return d; }
+
+  /* ---- 32×32 的 tile 网格 ---- */
+  document.querySelectorAll('.tile').forEach(function(el){
+    var n    = +(el.dataset.n || 32);
+    var kind = el.dataset.kind || '';
+    var hlRow = el.dataset.hlrow !== undefined ? +el.dataset.hlrow : -1;
+    var hlCol = el.dataset.hlcol !== undefined ? +el.dataset.hlcol : -1;
+    var ring  = el.dataset.ring ? el.dataset.ring.split(',').map(Number) : null;
+    el.style.gridTemplateColumns = 'repeat(' + n + ', 15px)';
+    var f = document.createDocumentFragment();
+    for (var r = 0; r < n; r++){
+      for (var c = 0; c < n; c++){
+        var cls = 'cell';
+        if (kind) cls += ' ' + kind;
+        if (r === hlRow || c === hlCol) cls += ' on';
+        var d = cell(cls);
+        if (ring && ring[0] === r && ring[1] === c) d.classList.add('ring');
+        f.appendChild(d);
+      }
+    }
+    el.appendChild(f);
+  });
+
+  /* ---- 一行的 bar：… dim dim [32 格窗口] dim dim … ---- */
+  document.querySelectorAll('.bar').forEach(function(el){
+    var kind = el.dataset.kind || '';
+    var on   = el.dataset.on === '1';
+    var f = document.createDocumentFragment();
+    f.appendChild(cell('gap'));
+    var l = document.createElement('span'); l.className='ell'; l.textContent='…'; f.appendChild(l);
+    for (var i = 0; i < 32; i++){
+      var d = cell(kind + (on ? ' on' : ''));
+      f.appendChild(d);
+    }
+    var r = document.createElement('span'); r.className='ell'; r.textContent='…'; f.appendChild(r);
+    f.appendChild(cell('gap'));
+    el.appendChild(f);
+  });
+
+  /* ---- lane 刻度 ---- */
+  var la = document.getElementById('laneA');
+  if (la){
+    for (var i = 0; i < 32; i++){
+      var t = document.createElement('div');
+      t.className = 'tick';
+      t.textContent = (i % 8 === 0 || i === 31) ? i : '';
+      la.appendChild(t);
+    }
+  }
+})();
+</script>
+</body>
+</html>
