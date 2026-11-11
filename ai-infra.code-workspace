@@ -7,6 +7,9 @@
         },
         {
             "path": "Distirbution-Training"
+        },
+        {
+            "path":"vLLM"
         }
     ],
     // 以后新增平级项目时，在这里追加，例如：
